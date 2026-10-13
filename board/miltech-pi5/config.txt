@@ -1,0 +1,9 @@
+# https://www.raspberrypi.com/documentation/computers/config_txt.html
+
+kernel=Image
+
+arm_64bit=1
+
+disable_overscan=1
+
+disable_splash=1
