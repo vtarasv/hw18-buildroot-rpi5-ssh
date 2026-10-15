@@ -1,0 +1,2 @@
+# pwm-fan built in: the Pi 5 Active Cooler is controlled from boot, no module loading needed
+CONFIG_SENSORS_PWM_FAN=y
