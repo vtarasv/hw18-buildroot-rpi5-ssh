@@ -1,0 +1,10 @@
+config BR2_PACKAGE_ROS2
+	bool "ros2"
+	depends on BR2_INSTALL_LIBSTDCPP
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	depends on BR2_USE_WCHAR # spdlog
+	select BR2_PACKAGE_LIBYAML
+	select BR2_PACKAGE_SPDLOG
+	help
+	  Minimal ROS 2 Jazzy (rclcpp, Cyclone DDS, std_msgs, std_srvs)
+	  and the miltech_counter nodes, installed in /opt/ros/jazzy.

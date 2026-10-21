@@ -1,0 +1,2 @@
+name: ROS2
+desc: ROS 2 Jazzy layer (rclcpp + Cyclone DDS)
