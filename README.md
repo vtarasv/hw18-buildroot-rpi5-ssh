@@ -2,6 +2,8 @@
 
 **Goal:** starting from an empty git repo, build a custom Linux image for the Raspberry Pi 5 with **Buildroot**. Take Buildroot's stock Pi 5 config, keep your changes in a separate BR2_EXTERNAL tree, and add the **Dropbear** SSH server with key-only login. Build on **Fedora 44**, flash a microSD card, then log in with `ssh root@miltech-br.local`. Finally, check that a clean clone reproduces the same OS.
 
+**Part 2** (sections 15–20) adds **ROS 2**. You try it on the laptop first, then write publisher and subscriber nodes that count 1, 2, 3… over a topic. These go into the image through a second BR2_EXTERNAL tree (the "meta-layer"), and you run the nodes on the Pi.
+
 **Hardware:** Raspberry Pi 5, USB-C power supply, a spare microSD card, a card reader, an Ethernet cable. A monitor (micro-HDMI) and keyboard are optional and help with debugging.
 **Host:** Fedora 44, x86_64, ~15 GB free disk, ~1 GB of downloads. The first build takes 15–40 min.
 
@@ -26,7 +28,17 @@ Commit after every step. The git history then documents the work.
 12. [Network, first boot, SSH](#12-network-first-boot-ssh)
 13. [Checks on the Pi](#13-checks-on-the-pi)
 14. [Reproduce from a clean clone](#14-reproduce-from-a-clean-clone)
-15. [Sources](#sources)
+
+**Part 2: ROS 2**
+
+15. [ROS 2 on the laptop](#15-ros-2-on-the-laptop)
+16. [Counter nodes](#16-counter-nodes)
+17. [Check with the ROS 2 CLI](#17-check-with-the-ros-2-cli)
+18. [ROS 2 layer for Buildroot](#18-ros-2-layer-for-buildroot)
+19. [Build the image with ROS 2](#19-build-the-image-with-ros-2)
+20. [Run the nodes on the Pi](#20-run-the-nodes-on-the-pi)
+
+[Sources](#sources)
 
 ---
 
@@ -627,7 +639,14 @@ GUI alternatives:
 - Raspberry Pi Imager → *Use Custom*. Skip its customization dialog, which only applies to Raspberry Pi OS.
 - GNOME Disks → *Restore Disk Image…*.
 
-Re-insert the card. Fedora mounts both partitions. Boot should contain `config.txt`, `cmdline.txt`, `Image`, `*.dtb` and `overlays/`. Eject before removing the card.
+Re-insert the card. Fedora mounts both partitions. Boot should contain `config.txt`, `cmdline.txt`, `Image`, `*.dtb` and `overlays/`. Eject before removing the card:
+
+```bash
+for p in ${DEV}?*; do udisksctl unmount -b $p; done   # unmount both partitions (no sudo)
+udisksctl power-off -b $DEV                           # flush and power off the reader; now safe to pull
+```
+
+`udisksctl` is what the file manager's Eject button uses. If a partition is busy, `cd` out of it first.
 
 ---
 
@@ -644,6 +663,7 @@ nmcli device status                         # find the wired interface, e.g. enp
 nmcli connection add type ethernet ifname enpXsY con-name pi-direct ipv4.method shared ipv6.method disabled
 nmcli connection up pi-direct
 sudo firewall-cmd --zone=nm-shared --add-service=mdns     # so *.local resolves
+sudo firewall-cmd --zone=nm-shared --add-service=mdns --permanent   # and still does after a reboot
 ```
 
 Or get the IP with `ip neigh show dev enpXsY`.
@@ -663,6 +683,17 @@ A power supply under 5 A can limit USB current, but it does not stop the Pi from
 ping -c 3 miltech-br.local
 ssh root@miltech-br.local                 # accept the host key the first time; no password asked
 ```
+
+`Permission denied (publickey)` usually means ssh didn't offer the right key. Without an agent, it only tries the default names (`id_ed25519`, `id_rsa`, …). If the key in `authorized_keys` has another name, point ssh to it in `~/.ssh/config`:
+
+```
+Host miltech-br.local 10.42.0.*
+    User root
+    IdentityFile ~/.ssh/id_ed25519_rpi5
+    IdentitiesOnly yes
+```
+
+Each reflash creates new host keys, so ssh then refuses with `Host key verification failed`. Remove the old key: `ssh-keygen -R miltech-br.local; ssh-keygen -R <pi-ip>`.
 
 Check that password login is really disabled:
 
@@ -719,6 +750,515 @@ make -C output
 
 ---
 
+# Part 2: ROS 2
+
+> ⚠️ **Draft.** This part was written before the first ROS 2 build. Expect to fix details in sections 18–19 along the way, and update this file to match.
+
+```
+ Fedora (laptop), container ros:jazzy                               Raspberry Pi 5
+ ────────────────────────────────────────────────────────────       ──────────────
+ 15 demo talker/listener
+ 16 miltech_counter: counter_pub ──/counter──► counter_sub
+ 17 ros2 node/topic/service …
+ 18 meta-ros2/ (2nd BR2_EXTERNAL): ros2 package = colcon + cross toolchain
+ 19 make ──► sdcard.img with /opt/ros/jazzy ─────────────────────►  boot
+ 20 ros2 topic echo /counter ◄──────── DDS over Ethernet ─────────── counter_pub
+```
+
+Both sides use **ROS 2 Jazzy**, the LTS release supported until 2029.
+
+**What it adds to the repo:**
+
+```
+buildroot-rpi5-ssh/
+└── meta-ros2/                         second BR2_EXTERNAL tree, name: ROS2
+    ├── external.desc, Config.in, external.mk
+    ├── host-requirements.txt          host Python tools: colcon, code generators
+    ├── ros2.repos                     ROS 2 source repos, pinned
+    ├── package/ros2/
+    │   ├── Config.in
+    │   ├── ros2.mk                    colcon build with Buildroot's toolchain
+    │   └── ros2.sh                    /etc/profile.d/ros2.sh on the Pi
+    └── src/
+        ├── miltech_counter/           your nodes (committed)
+        └── rclcpp/, rcl/, …           ROS 2 sources from vcs import (git-ignored)
+```
+
+---
+
+## 15. ROS 2 on the laptop
+
+ROS 2 publishes binary packages for Ubuntu but not for Fedora. On the laptop, run it in the official Ubuntu-based container instead. `--net=host` lets the container discover nodes on the Pi later (section 20).
+
+```bash
+mkdir -p meta-ros2/src/miltech_counter/src
+podman run -d --name ros2 --net=host -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+  -v $PWD/meta-ros2/src/miltech_counter:/ws/src/miltech_counter:Z \
+  docker.io/library/ros:jazzy sleep infinity
+podman exec ros2 bash -c 'apt-get update && apt-get install -y ros-jazzy-demo-nodes-cpp ros-jazzy-rmw-cyclonedds-cpp
+  echo "source /opt/ros/jazzy/setup.bash; [ -f /ws/install/setup.bash ] && source /ws/install/setup.bash" >> /root/.bashrc'
+```
+
+- `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` selects the DDS implementation. Jazzy's default is Fast DDS, but the Pi image uses Cyclone DDS (section 18). Use the same on both sides.
+- Open each terminal with `podman exec -it ros2 bash`.
+- The container keeps its state until `podman rm -f ros2`. Your code is on the host, so removing the container loses nothing.
+
+Run the official demo nodes, each in its own terminal:
+
+```bash
+ros2 run demo_nodes_cpp talker      # Publishing: 'Hello World: 1'
+ros2 run demo_nodes_cpp listener    # I heard: [Hello World: 1]
+ros2 node list                      # /talker /listener
+ros2 topic list                     # /chatter /parameter_events /rosout
+```
+
+---
+
+## 16. Counter nodes
+
+One package with three nodes. Each node is a small C++ program built on `rclcpp`.
+
+| Node | Does |
+|---|---|
+| `counter_pub` | publishes 1, 2, 3… on `/counter` (`std_msgs/msg/UInt32`) once per second, and serves `/counter/enable` (`std_srvs/srv/SetBool`): `true` starts counting, `false` stops it |
+| `counter_sub` | prints every number received on `/counter` |
+| `counter_switch` | calls `/counter/enable` (extra task): `counter_switch on` or `counter_switch off` |
+
+`meta-ros2/src/miltech_counter/package.xml`:
+
+```xml
+<?xml version="1.0"?>
+<package format="3">
+  <name>miltech_counter</name>
+  <version>0.1.0</version>
+  <description>Counter publisher/subscriber with a start/stop service</description>
+  <maintainer email="you@example.com">Your Name</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
+```
+
+`meta-ros2/src/miltech_counter/CMakeLists.txt`:
+
+```cmake
+cmake_minimum_required(VERSION 3.8)
+project(miltech_counter)
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+
+foreach(node counter_pub counter_sub counter_switch)
+  add_executable(${node} src/${node}.cpp)
+  target_link_libraries(${node} rclcpp::rclcpp ${std_msgs_TARGETS} ${std_srvs_TARGETS})
+  install(TARGETS ${node} DESTINATION lib/${PROJECT_NAME})
+endforeach()
+
+ament_package()
+```
+
+`src/counter_pub.cpp`:
+
+```cpp
+// Publishes 1, 2, 3... on /counter every second.
+// Service /counter/enable (std_srvs/SetBool) starts and stops counting.
+#include <chrono>
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/u_int32.hpp>
+#include <std_srvs/srv/set_bool.hpp>
+
+using namespace std::chrono_literals;
+using std_msgs::msg::UInt32;
+using std_srvs::srv::SetBool;
+
+class CounterPub : public rclcpp::Node
+{
+public:
+  CounterPub() : Node("counter_pub")
+  {
+    pub_ = create_publisher<UInt32>("counter", 10);
+    timer_ = create_wall_timer(1s, [this] {
+      if (!enabled_) return;
+      UInt32 msg;
+      msg.data = ++count_;
+      RCLCPP_INFO(get_logger(), "publish %u", msg.data);
+      pub_->publish(msg);
+    });
+    srv_ = create_service<SetBool>("counter/enable",
+      [this](const SetBool::Request::SharedPtr req, SetBool::Response::SharedPtr res) {
+        enabled_ = req->data;
+        res->success = true;
+        res->message = enabled_ ? "started" : "stopped";
+        RCLCPP_INFO(get_logger(), "%s", res->message.c_str());
+      });
+  }
+
+private:
+  bool enabled_ = true;
+  uint32_t count_ = 0;
+  rclcpp::Publisher<UInt32>::SharedPtr pub_;
+  rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::Service<SetBool>::SharedPtr srv_;
+};
+
+int main(int argc, char ** argv)
+{
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<CounterPub>());
+  rclcpp::shutdown();
+}
+```
+
+`src/counter_sub.cpp`:
+
+```cpp
+// Prints every number received on /counter.
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/u_int32.hpp>
+
+int main(int argc, char ** argv)
+{
+  rclcpp::init(argc, argv);
+  auto node = rclcpp::Node::make_shared("counter_sub");
+  auto log = node->get_logger();
+  auto sub = node->create_subscription<std_msgs::msg::UInt32>("counter", 10,
+    [log](const std_msgs::msg::UInt32 & msg) { RCLCPP_INFO(log, "got %u", msg.data); });
+  rclcpp::spin(node);
+  rclcpp::shutdown();
+}
+```
+
+`src/counter_switch.cpp`:
+
+```cpp
+// Starts or stops counter_pub: counter_switch on|off
+#include <chrono>
+#include <cstdio>
+#include <rclcpp/rclcpp.hpp>
+#include <std_srvs/srv/set_bool.hpp>
+
+using namespace std::chrono_literals;
+using std_srvs::srv::SetBool;
+
+int main(int argc, char ** argv)
+{
+  auto args = rclcpp::init_and_remove_ros_arguments(argc, argv);
+  if (args.size() != 2 || (args[1] != "on" && args[1] != "off")) {
+    fprintf(stderr, "usage: counter_switch on|off\n");
+    return 2;
+  }
+  auto node = rclcpp::Node::make_shared("counter_switch");
+  auto client = node->create_client<SetBool>("counter/enable");
+  if (!client->wait_for_service(5s)) {
+    RCLCPP_ERROR(node->get_logger(), "/counter/enable is not available");
+    return 1;
+  }
+  auto req = std::make_shared<SetBool::Request>();
+  req->data = args[1] == "on";
+  auto future = client->async_send_request(req);
+  if (rclcpp::spin_until_future_complete(node, future, 5s) != rclcpp::FutureReturnCode::SUCCESS) {
+    RCLCPP_ERROR(node->get_logger(), "no response");
+    return 1;
+  }
+  RCLCPP_INFO(node->get_logger(), "%s", future.get()->message.c_str());
+  rclcpp::shutdown();
+}
+```
+
+Build and run in the container:
+
+```bash
+cd /ws && colcon build && source install/setup.bash
+ros2 run miltech_counter counter_pub    # terminal 1: [counter_pub]: publish 1, 2, 3…
+ros2 run miltech_counter counter_sub    # terminal 2: [counter_sub]: got 1, 2, 3…
+```
+
+```bash
+git add meta-ros2/src/miltech_counter
+git commit -m "miltech_counter: counter publisher/subscriber + start/stop service"
+```
+
+---
+
+## 17. Check with the ROS 2 CLI
+
+Run these in a third terminal while both nodes are running:
+
+```bash
+ros2 node list                    # /counter_pub /counter_sub
+ros2 node info /counter_pub       # publishes /counter, serves /counter/enable
+ros2 topic list -t                # /counter [std_msgs/msg/UInt32]
+ros2 topic info /counter -v       # 1 publisher, 1 subscriber, QoS of each
+ros2 topic echo /counter          # data: 17 …
+ros2 topic hz /counter            # average rate: 1.000
+ros2 service list -t              # /counter/enable [std_srvs/srv/SetBool]
+ros2 interface show std_srvs/srv/SetBool
+```
+
+Stop and start the counter (extra task):
+
+```bash
+ros2 service call /counter/enable std_srvs/srv/SetBool "{data: false}"   # via the CLI
+ros2 run miltech_counter counter_switch on                             # via your own node
+```
+
+While the counter is stopped, `counter_sub` prints nothing. After `on`, it continues from the last number.
+
+---
+
+## 18. ROS 2 layer for Buildroot
+
+Buildroot accepts several BR2_EXTERNAL trees, separated by colons: `BR2_EXTERNAL=dir1:dir2`. A second tree is Buildroot's version of a Yocto meta-layer, and it keeps everything ROS-related out of the board tree.
+
+Buildroot has no ROS 2 packages. The layer defines one package, `ros2`. It runs **colcon** with Buildroot's CMake toolchain file and cross-compiles a minimal C++ ROS 2 (about 60 packages) together with `miltech_counter`. The minimal set is `rclcpp`, Cyclone DDS, `std_msgs` and `std_srvs`. Python, `rclpy` and the `ros2` CLI are not included, so the image stays small. Inspect the Pi from the laptop instead (section 20).
+
+### 18.1 Tree files
+
+```bash
+mkdir -p meta-ros2/package/ros2
+```
+
+`meta-ros2/external.desc`:
+
+```
+name: ROS2
+desc: ROS 2 Jazzy layer (rclcpp + Cyclone DDS)
+```
+
+`meta-ros2/Config.in`:
+
+```
+source "$BR2_EXTERNAL_ROS2_PATH/package/ros2/Config.in"
+```
+
+`meta-ros2/external.mk`:
+
+```make
+include $(sort $(wildcard $(BR2_EXTERNAL_ROS2_PATH)/package/*/*.mk))
+```
+
+### 18.2 ROS 2 sources
+
+ROS 2 consists of many git repos, and a `.repos` file lists them for `vcs` (vcstool). The original vcstool package breaks on Python 3.14 (`No module named pkg_resources`), so install its maintained fork `vcs2l`. The full Jazzy list has ~100 repos. `rosinstall_generator` builds a shorter list from the official package index: it starts from the packages you name and follows their declared dependencies.
+
+```bash
+sudo dnf install pipx && pipx install vcs2l && pipx install rosinstall-generator   # vcs2l: maintained fork of vcstool, same `vcs` command
+cd meta-ros2
+rosinstall_generator --rosdistro jazzy --deps --upstream --format repos \
+    rclcpp std_msgs std_srvs rmw_cyclonedds_cpp \
+  --exclude rmw_fastrtps_cpp rmw_fastrtps_dynamic_cpp rmw_connextdds \
+    rosidl_typesupport_fastrtps_c rosidl_typesupport_fastrtps_cpp rosidl_dynamic_typesupport_fastrtps \
+    rosidl_generator_py rosidl_generator_rs iceoryx_binding_c iceoryx_posh iceoryx_hoofs \
+    ament_lint_auto ament_lint_common ament_cmake_gtest ament_cmake_gmock ament_cmake_google_benchmark \
+    ament_cmake_pytest mimick_vendor performance_test_fixture test_msgs osrf_testing_tools_cpp \
+    launch_testing_ament_cmake \
+  > ros2.repos
+vcs import --input ros2.repos src
+cd ..
+```
+
+- `--upstream`: take each repo from GitHub at its Jazzy **release tag** (e.g. `rclcpp` 28.1.22), so the list is already pinned. To update, run the generator again.
+- `--exclude`: without it you get 49 repos. Most of the extra ones are other DDS implementations, Python and Rust message bindings, and test frameworks. Excluding them leaves about 30. `rmw_implementation` lists all DDS implementations as dependencies, and colcon would build any of them it finds in `src/`.
+- Four test-only repos remain: `ament_lint`, `launch`, `osrf_pycommon` and `uncrustify_vendor`. The `test_msgs` package inside `rcl_interfaces` is test-only too. colcon's `--packages-up-to` also follows test dependencies and would build them, so `ros2.mk` puts a `COLCON_IGNORE` file in each of them (18.4).
+- If you keep the exclude names in a shell variable, zsh passes `$X` as a single word, and the generator then ignores the whole list. Write `${=X}` instead, or list the names directly as above.
+
+Ignore the downloaded sources and keep your package. Add to `.gitignore`:
+
+```
+meta-ros2/src/*
+!meta-ros2/src/miltech_counter/
+```
+
+### 18.3 Host tools
+
+`colcon` and the ROS message code generators (`rosidl`, written in Python) run on the build host. The package creates a venv for them in `output/host/`. Use `/usr/bin/python3` there, not whatever `python3` comes first in `PATH`, since that could be conda.
+
+`meta-ros2/host-requirements.txt`:
+
+```
+colcon-common-extensions
+catkin_pkg
+empy
+lark
+setuptools
+```
+
+### 18.4 The `ros2` package
+
+`meta-ros2/package/ros2/Config.in`:
+
+```
+config BR2_PACKAGE_ROS2
+	bool "ros2"
+	depends on BR2_INSTALL_LIBSTDCPP
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	depends on BR2_USE_WCHAR # spdlog
+	select BR2_PACKAGE_LIBYAML
+	select BR2_PACKAGE_SPDLOG
+	help
+	  Minimal ROS 2 Jazzy (rclcpp, Cyclone DDS, std_msgs, std_srvs)
+	  and the miltech_counter nodes, installed in /opt/ros/jazzy.
+```
+
+`meta-ros2/package/ros2/ros2.mk`:
+
+```make
+################################################################################
+#
+# ros2
+#
+################################################################################
+
+ROS2_VERSION = jazzy
+ROS2_SITE = $(BR2_EXTERNAL_ROS2_PATH)/src
+ROS2_SITE_METHOD = local
+ROS2_LICENSE = Apache-2.0, EPL-2.0 (cyclonedds)
+ROS2_DEPENDENCIES = libyaml spdlog
+
+ROS2_PREFIX = /opt/ros/$(ROS2_VERSION)
+ROS2_VENV = $(HOST_DIR)/ros2-venv
+
+# colcon and the rosidl code generators run on the build host
+define ROS2_HOST_TOOLS
+	/usr/bin/python3 -m venv $(ROS2_VENV)
+	$(ROS2_VENV)/bin/pip install -q -r $(BR2_EXTERNAL_ROS2_PATH)/host-requirements.txt
+endef
+ROS2_PRE_CONFIGURE_HOOKS += ROS2_HOST_TOOLS
+
+# Test-only repos pulled in by test dependencies: colcon would build them too
+# (uncrustify_vendor even tries to git-clone uncrustify). Hide them from colcon.
+define ROS2_IGNORE_TEST_REPOS
+	touch $(addsuffix /COLCON_IGNORE,$(addprefix $(@D)/,ament_lint launch osrf_pycommon uncrustify_vendor \
+		rcl_interfaces/test_msgs))
+endef
+ROS2_POST_RSYNC_HOOKS += ROS2_IGNORE_TEST_REPOS
+
+# Each ROS package builds against the ones before it, so colcon installs
+# straight into staging. Cyclone options: no host-only tools, no iceoryx/SSL.
+# TRACETOOLS_DISABLED: no LTTng tracing (would need lttng-ust).
+define ROS2_BUILD_CMDS
+	cd $(@D) && $(TARGET_MAKE_ENV) RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+		$(ROS2_VENV)/bin/colcon --log-base log build \
+		--merge-install --install-base $(STAGING_DIR)$(ROS2_PREFIX) \
+		--packages-up-to rmw_cyclonedds_cpp miltech_counter \
+		--event-handlers console_cohesion+ \
+		--cmake-args \
+			-DCMAKE_TOOLCHAIN_FILE=$(HOST_DIR)/share/buildroot/toolchainfile.cmake \
+			-DCMAKE_BUILD_TYPE=Release \
+			-DBUILD_TESTING=OFF \
+			-DPython3_EXECUTABLE=$(ROS2_VENV)/bin/python3 \
+			-DBUILD_IDLC=OFF -DBUILD_DDSPERF=OFF -DENABLE_SHM=OFF -DENABLE_SSL=OFF \
+			-DTRACETOOLS_DISABLED=ON
+endef
+
+# runtime files only: no headers, CMake files or Python modules
+define ROS2_INSTALL_TARGET_CMDS
+	mkdir -p $(TARGET_DIR)$(ROS2_PREFIX)
+	rsync -a --exclude include --exclude cmake --exclude 'python3*' \
+		$(STAGING_DIR)$(ROS2_PREFIX)/ $(TARGET_DIR)$(ROS2_PREFIX)/
+	$(INSTALL) -D -m 0644 $(ROS2_PKGDIR)/ros2.sh $(TARGET_DIR)/etc/profile.d/ros2.sh
+endef
+
+$(eval $(generic-package))
+```
+
+- `SITE_METHOD = local`: Buildroot copies `src/` into `output/build/ros2-jazzy/`. After you edit the nodes, `make ros2-rebuild` copies them again.
+- `--packages-up-to`: colcon builds only these packages and what they depend on. Python and test packages in the same repos are skipped.
+- `libyaml` and `spdlog` come from Buildroot. Their versions match what `libyaml_vendor` and `spdlog_vendor` look for, so nothing is downloaded during the build.
+- `rmw_cyclonedds_cpp` is listed explicitly because `rcl` only finds a DDS implementation at runtime.
+
+`meta-ros2/package/ros2/ros2.sh` (on the Pi there is no `bash` for `setup.bash`, so set the variables directly):
+
+```sh
+# ROS 2 runtime environment
+export AMENT_PREFIX_PATH=/opt/ros/jazzy
+export LD_LIBRARY_PATH=/opt/ros/jazzy/lib
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export PATH=$PATH:/opt/ros/jazzy/lib/miltech_counter
+```
+
+`AMENT_PREFIX_PATH` is needed at runtime. ROS uses it to find and load the DDS and message type support libraries by name.
+
+```bash
+git add .gitignore meta-ros2
+git commit -m "meta-ros2: br2-external layer with minimal ROS 2 Jazzy + miltech_counter"
+```
+
+---
+
+## 19. Build the image with ROS 2
+
+Load the defconfig with **both** trees, then enable the package:
+
+```bash
+make -C buildroot O=$PWD/output BR2_EXTERNAL=$PWD:$PWD/meta-ros2 miltech_pi5_defconfig
+make -C output menuconfig     # External options → ROS 2 Jazzy layer → [*] ros2
+make -C output savedefconfig
+git diff configs/             # + BR2_PACKAGE_ROS2=y
+make -C output
+```
+
+- If a later build runs without `meta-ros2` in `BR2_EXTERNAL`, Buildroot silently drops `BR2_PACKAGE_ROS2`. From now on, section 14's build command is `make -C buildroot O=$PWD/output BR2_EXTERNAL=$PWD:$PWD/meta-ros2 miltech_pi5_defconfig`. On a clean clone, run `vcs import --input meta-ros2/ros2.repos meta-ros2/src` first.
+- The `ros2` package takes about 10–20 min. If it fails, colcon prints the failing package and keeps logs in `output/build/ros2-jazzy/log/latest_build/`.
+- If `mkfs.ext4` runs out of space, raise `BR2_TARGET_ROOTFS_EXT2_SIZE` (currently 256M).
+
+Check without the Pi:
+
+```bash
+file output/target/opt/ros/jazzy/lib/miltech_counter/counter_pub   # ELF 64-bit … ARM aarch64
+du -sh output/target/opt/ros                                       # tens of MB
+ls output/target/opt/ros/jazzy/lib/librmw_cyclonedds_cpp.so
+```
+
+```bash
+git commit -am "defconfig: enable ROS 2"
+```
+
+---
+
+## 20. Run the nodes on the Pi
+
+Flash the image as in section 11, then log in with `ssh root@miltech-br.local`. `/etc/profile.d/ros2.sh` has already set up the environment.
+
+```bash
+counter_sub &        # got 1, 2, 3…
+counter_pub          # publish 1, 2, 3…
+```
+
+In a second SSH session, test the service:
+
+```bash
+counter_switch off   # counter_pub: stopped
+counter_switch on    # counter_pub: started
+```
+
+**From the laptop.** The Pi has no `ros2` CLI, but DDS works across the network. With the nodes running on the Pi, the laptop container sees them too:
+
+```bash
+ros2 node list                          # /counter_pub /counter_sub (on the Pi)
+ros2 topic echo /counter
+ros2 run miltech_counter counter_switch off     # stops the counter on the Pi
+```
+
+- **Direct cable:** the `nm-shared` firewall zone blocks DDS traffic from the Pi. Allow UDP from the Pi's subnet until the next reboot:
+
+  ```bash
+  sudo firewall-cmd --zone=nm-shared --add-rich-rule='rule family=ipv4 source address=10.42.0.0/24 protocol value=udp accept'
+  ```
+
+- Both sides must use the same `ROS_DOMAIN_ID` (default 0). If other ROS 2 users are on the same network, pick another ID on both sides, e.g. `export ROS_DOMAIN_ID=42`.
+
+---
+
 ## Sources
 
 **Buildroot 2026.08**
@@ -731,5 +1271,10 @@ make -C output
 - [LED warning codes](https://www.raspberrypi.com/documentation/computers/configuration.html#led-warning-flash-codes) · [Boot EEPROM](https://www.raspberrypi.com/documentation/computers/raspberry-pi.html#raspberry-pi-boot-eeprom) · [Imager](https://www.raspberrypi.com/documentation/computers/getting-started.html#install-using-imager) · [SSH without a password](https://www.raspberrypi.com/documentation/computers/remote-access.html#configure-ssh-without-a-password)
 - RPi kernel 6.12: `drivers/pinctrl/bcm/pinctrl-bcm2712.c`, `arch/arm64/boot/dts/overlays/bcm2712d0-overlay.dts`
 - [Mender Hub: Asynchronous SError Interrupt on RPi5](https://hub.mender.io/t/asynchronous-serror-interrupt-rpi5-boot-issue/7275): the same panic, fixed with `bcm2712d0.dtbo`
+
+**ROS 2 Jazzy** ([docs](https://docs.ros.org/en/jazzy/))
+- Tutorials: [C++ publisher and subscriber](https://docs.ros.org/en/jazzy/Tutorials/Beginner-Client-Libraries/Writing-A-Simple-Cpp-Publisher-And-Subscriber.html) · [C++ service and client](https://docs.ros.org/en/jazzy/Tutorials/Beginner-Client-Libraries/Writing-A-Simple-Cpp-Service-And-Client.html) · [Understanding topics](https://docs.ros.org/en/jazzy/Tutorials/Beginner-CLI-Tools/Understanding-ROS2-Topics/Understanding-ROS2-Topics.html) · [Understanding services](https://docs.ros.org/en/jazzy/Tutorials/Beginner-CLI-Tools/Understanding-ROS2-Services/Understanding-ROS2-Services.html)
+- [`ros2.repos` for Jazzy](https://github.com/ros2/ros2/blob/jazzy/ros2.repos) · [rosinstall_generator](https://github.com/ros-infrastructure/rosinstall_generator) · [ros container images](https://hub.docker.com/_/ros) · [Cross-compiling ROS 2 packages (design article)](https://design.ros2.org/articles/cc_build_tools.html)
+- Buildroot manual: Using several external trees, Infrastructure for packages with specific build systems (`generic-package`), Using a CMake toolchain file
 
 **Other:** [nmcli `ipv4.method shared`](https://networkmanager.dev/docs/api/latest/nm-settings-nmcli.html)
