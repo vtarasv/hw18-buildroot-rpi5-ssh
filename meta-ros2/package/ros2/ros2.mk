@@ -20,8 +20,17 @@ define ROS2_HOST_TOOLS
 endef
 ROS2_PRE_CONFIGURE_HOOKS += ROS2_HOST_TOOLS
 
+# Test-only repos pulled in by test dependencies: colcon would build them too
+# (uncrustify_vendor even tries to git-clone uncrustify). Hide them from colcon.
+define ROS2_IGNORE_TEST_REPOS
+	touch $(addsuffix /COLCON_IGNORE,$(addprefix $(@D)/,ament_lint launch osrf_pycommon uncrustify_vendor \
+		rcl_interfaces/test_msgs))
+endef
+ROS2_POST_RSYNC_HOOKS += ROS2_IGNORE_TEST_REPOS
+
 # Each ROS package builds against the ones before it, so colcon installs
 # straight into staging. Cyclone options: no host-only tools, no iceoryx/SSL.
+# TRACETOOLS_DISABLED: no LTTng tracing (would need lttng-ust).
 define ROS2_BUILD_CMDS
 	cd $(@D) && $(TARGET_MAKE_ENV) RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
 		$(ROS2_VENV)/bin/colcon --log-base log build \
@@ -33,7 +42,8 @@ define ROS2_BUILD_CMDS
 			-DCMAKE_BUILD_TYPE=Release \
 			-DBUILD_TESTING=OFF \
 			-DPython3_EXECUTABLE=$(ROS2_VENV)/bin/python3 \
-			-DBUILD_IDLC=OFF -DBUILD_DDSPERF=OFF -DENABLE_SHM=OFF -DENABLE_SSL=OFF
+			-DBUILD_IDLC=OFF -DBUILD_DDSPERF=OFF -DENABLE_SHM=OFF -DENABLE_SSL=OFF \
+			-DTRACETOOLS_DISABLED=ON
 endef
 
 # runtime files only: no headers, CMake files or Python modules
